@@ -6,5 +6,5 @@ import react from "@vitejs/plugin-react";
 // If you rename the repo, update this string (keep the leading and trailing slash).
 export default defineConfig({
   plugins: [react()],
-  base: "/west-bridgford-rota/",
+  base: "/rotor-app/",
 });
