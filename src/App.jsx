@@ -85,9 +85,15 @@ function autoFill(dates, staff, unavailMap) {
   dates.forEach(d => { result[dateKey(d)] = {}; });
   dates.forEach(date => {
     const dk = dateKey(date);
+    const usedToday = new Set();          // names already assigned a role this date
     JOBS.forEach(job => {
       const unavailSet = unavailMap[dk] || new Set();
-      const eligible = staff.filter(s => s.name.trim() && s.jobs.includes(job) && !unavailSet.has(s.name));
+      const eligible = staff.filter(s =>
+        s.name.trim() &&
+        s.jobs.includes(job) &&
+        !unavailSet.has(s.name) &&
+        !usedToday.has(s.name)            // no one does two roles on the same date
+      );
       if (!eligible.length) { result[dk][job] = ""; return; }
       eligible.sort((a, b) => {
         const diff = (count[a.id][job]||0) - (count[b.id][job]||0);
@@ -97,6 +103,7 @@ function autoFill(dates, staff, unavailMap) {
       const chosen = eligible[0];
       result[dk][job] = chosen.name;
       count[chosen.id][job] = (count[chosen.id][job]||0) + 1;
+      usedToday.add(chosen.name);
     });
   });
   return result;
@@ -194,6 +201,8 @@ export default function RotaApp() {
   const [assignments, setAssignments] = useState({});
   const [autoFilled, setAutoFilled]   = useState(false);
   const [newUnavail, setNewUnavail]   = useState({ name: "", date: "" });
+  const [gridPerson, setGridPerson]   = useState("");      // person selected in the new tick-box grid
+  const [conflict, setConflict]       = useState(null);    // {name, dk, jobs:[...]} pending popup, or null
   const [editingCell, setEditingCell] = useState(null);
   const [saveStatus, setSaveStatus]   = useState("");
   const [loading, setLoading]         = useState(true);
@@ -345,6 +354,86 @@ export default function RotaApp() {
     setNewUnavail({ name: "", date: "" });
   }
 
+  // Toggle a person's unavailability for a meeting date via the tick-box grid.
+  function toggleUnavail(name, dk) {
+    const existing = unavail.find(u => u.name === name && u.date === dk);
+    if (existing) {
+      // Un-ticking: just make them available again.
+      setUnavail(prev => prev.filter(u => u.id !== existing.id));
+      return;
+    }
+    // Ticking unavailable — record it, then check for clashes with a generated rota.
+    setUnavail(prev => [...prev, { id: Date.now(), name, date: dk }]);
+    if (autoFilled) {
+      const clashingJobs = JOBS.filter(job => assignments[dk]?.[job] === name);
+      if (clashingJobs.length) setConflict({ name, dk, jobs: clashingJobs });
+    }
+  }
+
+  // Next eligible person for a role on a date (fewest assignments of that role,
+  // not unavailable, not already used that date). Returns "" if none.
+  function nextEligible(dk, job, excludeName) {
+    const unavailSet = unavailMap[dk] || new Set();
+    const usedToday = new Set(JOBS.map(j => assignments[dk]?.[j]).filter(Boolean));
+    const roleCount = {};
+    staff.forEach(s => { roleCount[s.name] = 0; });
+    Object.values(assignments).forEach(day => { const n = day[job]; if (n && roleCount[n] != null) roleCount[n]++; });
+    const pool = staff.filter(s =>
+      s.name.trim() && s.jobs.includes(job) &&
+      s.name !== excludeName &&
+      !unavailSet.has(s.name) &&
+      !usedToday.has(s.name)
+    );
+    if (!pool.length) return "";
+    pool.sort((a, b) => roleCount[a.name] - roleCount[b.name]);
+    return pool[0].name;
+  }
+
+  // Resolve the conflict popup with the chosen strategy.
+  function resolveConflict(mode) {
+    if (!conflict) return;
+    const { dk, jobs, name } = conflict;
+    if (mode === "clear") {
+      setAssignments(prev => {
+        const day = { ...(prev[dk] || {}) };
+        jobs.forEach(job => { day[job] = ""; });
+        return { ...prev, [dk]: day };
+      });
+    } else if (mode === "reassign") {
+      setAssignments(prev => {
+        const day = { ...(prev[dk] || {}) };
+        jobs.forEach(job => { day[job] = nextEligible(dk, job, name); });
+        return { ...prev, [dk]: day };
+      });
+    }
+    // "keep" leaves the assignment in place — it will simply show red (unavailable).
+    setConflict(null);
+  }
+
+  // ── CSV export (dates × roles grid) ──────────────────────────────────────────
+  function exportCSV() {
+    const esc = v => {
+      const s = String(v ?? "");
+      return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const header = ["Date", "Day", ...JOBS];
+    const rows = dates.map(d => {
+      const dk = dateKey(d);
+      return [fmtDate(d), fmtDay(d), ...JOBS.map(j => assignments[dk]?.[j] || "")];
+    });
+    const csv = [header, ...rows].map(r => r.map(esc).join(",")).join("\r\n");
+    const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `rota-${fmtYMD(new Date())}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    flashToast("CSV downloaded");
+  }
+
   const TABS = [
     { id: "rota",    label: "Rota" },
     { id: "setup",   label: "People & Roles" },
@@ -378,7 +467,7 @@ export default function RotaApp() {
               <div style={{ fontWeight: 700, fontSize: 18, letterSpacing: -0.2 }}>{APP_TITLE}</div>
               <div style={{ color: C.inkFaint, fontSize: 12 }}>Thursday &amp; Sunday duty scheduling</div>
             </div>
-            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <div className="no-print" style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
               <SaveBadge status={saveStatus} />
               <button onClick={downloadBackup} style={btnGhost}
                 onMouseOver={e => e.currentTarget.style.borderColor = C.accent}
@@ -389,7 +478,7 @@ export default function RotaApp() {
               <input ref={fileInput} type="file" accept="application/json,.json" onChange={handleRestoreFile} style={{ display: "none" }} />
             </div>
           </div>
-          <nav style={{ display: "flex", gap: 4 }}>
+          <nav className="no-print" style={{ display: "flex", gap: 4 }}>
             {TABS.map(t => {
               const active = tab === t.id;
               return (
@@ -411,7 +500,7 @@ export default function RotaApp() {
         {/* ══ ROTA TAB ══ */}
         {tab === "rota" && (
           <div>
-            <div style={{ ...card, padding: 18, marginBottom: 18, display: "flex", flexWrap: "wrap", gap: 16, alignItems: "flex-end" }}>
+            <div className="no-print" style={{ ...card, padding: 18, marginBottom: 18, display: "flex", flexWrap: "wrap", gap: 16, alignItems: "flex-end" }}>
               {[["From", fromDate, v => { setFromDate(v); setAutoFilled(false); setAssignments({}); }],
                 ["To",   toDate,   v => { setToDate(v);   setAutoFilled(false); setAssignments({}); }]].map(([label, val, fn]) => (
                 <div key={label}>
@@ -425,9 +514,17 @@ export default function RotaApp() {
               </div>
               <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center" }}>
                 {autoFilled && (
-                  <button onClick={() => { setAssignments({}); setAutoFilled(false); }} style={btnGhost}>Clear</button>
+                  <>
+                    <button onClick={() => window.print()} style={btnGhost} className="no-print"
+                      onMouseOver={e => e.currentTarget.style.borderColor = C.accent}
+                      onMouseOut={e => e.currentTarget.style.borderColor = C.line}>🖨 Print / PDF</button>
+                    <button onClick={exportCSV} style={btnGhost} className="no-print"
+                      onMouseOver={e => e.currentTarget.style.borderColor = C.accent}
+                      onMouseOut={e => e.currentTarget.style.borderColor = C.line}>⤓ CSV</button>
+                    <button onClick={() => { setAssignments({}); setAutoFilled(false); }} style={btnGhost} className="no-print">Clear</button>
+                  </>
                 )}
-                <button onClick={handleAutoFill} style={btnPrimary}
+                <button onClick={handleAutoFill} style={btnPrimary} className="no-print"
                   onMouseOver={e => e.currentTarget.style.background = C.accentDk}
                   onMouseOut={e => e.currentTarget.style.background = C.accent}>
                   {autoFilled ? "Re-generate" : "Auto-fill rota"}
@@ -578,25 +675,81 @@ export default function RotaApp() {
               <SaveBadge status={saveStatus} />
             </div>
             <p style={{ margin:"6px 0 18px", color:C.inkSoft, fontSize:13 }}>
-              Add a row per person per date they can't attend. Auto-fill skips them on that day.
+              Pick a person, then tick the meeting dates they can't attend. Auto-fill skips them on those days.
             </p>
 
-            <div style={{ display:"flex", gap:12, marginBottom:22, flexWrap:"wrap", alignItems:"flex-end", background:"#fbfbfd", padding:16, borderRadius:12, border:`1px solid ${C.line}` }}>
-              <div>
+            {/* Fast tick-box grid */}
+            <div style={{ marginBottom:24, background:"#fbfbfd", padding:16, borderRadius:12, border:`1px solid ${C.line}` }}>
+              <div style={{ marginBottom:14 }}>
                 <label style={labelS}>Person</label>
-                <select value={newUnavail.name} onChange={e=>setNewUnavail(p=>({...p,name:e.target.value}))} style={{ ...inputS, minWidth:190 }}>
-                  <option value="">— select —</option>
+                <select value={gridPerson} onChange={e=>setGridPerson(e.target.value)} style={{ ...inputS, minWidth:220 }}>
+                  <option value="">— select a person —</option>
                   {staff.filter(s=>s.name.trim()).map(s=><option key={s.id}>{s.name}</option>)}
                 </select>
               </div>
-              <div>
-                <label style={labelS}>Date</label>
-                <input type="date" value={newUnavail.date} onChange={e=>setNewUnavail(p=>({...p,date:e.target.value}))} style={inputS} />
-              </div>
-              <button onClick={addUnavail} style={btnPrimary}
-                onMouseOver={e => e.currentTarget.style.background = C.accentDk}
-                onMouseOut={e => e.currentTarget.style.background = C.accent}>+ Add</button>
+              {gridPerson && dates.length === 0 && (
+                <div style={{ color:C.inkFaint, fontSize:13, fontStyle:"italic" }}>
+                  No meeting dates in the current range — set a date range on the Rota tab first.
+                </div>
+              )}
+              {gridPerson && dates.length > 0 && (
+                <div style={{ display:"flex", flexWrap:"wrap", gap:8 }}>
+                  {dates.map(d => {
+                    const dk = dateKey(d);
+                    const off = (unavailMap[dk] || new Set()).has(gridPerson);
+                    const isSun = d.getDay() === 0;
+                    return (
+                      <button key={dk} onClick={() => toggleUnavail(gridPerson, dk)}
+                        style={{
+                          display:"flex", alignItems:"center", gap:7, padding:"8px 12px",
+                          borderRadius:9, cursor:"pointer", fontFamily:"inherit", fontSize:12,
+                          fontWeight:500, transition:"all 0.12s",
+                          border: off ? `1px solid ${C.bad}` : `1px solid ${C.line}`,
+                          background: off ? C.badBg : "#fff",
+                          color: off ? C.bad : C.ink,
+                        }}>
+                        <span style={{
+                          width:15, height:15, borderRadius:4, flexShrink:0,
+                          border: off ? `1px solid ${C.bad}` : `1px solid ${C.inkFaint}`,
+                          background: off ? C.bad : "#fff",
+                          color:"#fff", fontSize:11, lineHeight:"14px", textAlign:"center",
+                        }}>{off ? "✓" : ""}</span>
+                        <span>{fmtDate(d)}</span>
+                        <span style={{ color: off ? C.bad : (isSun ? C.accent : C.inkFaint), fontSize:11 }}>
+                          {isSun ? "Sun" : "Thu"}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+              {!gridPerson && (
+                <div style={{ color:C.inkFaint, fontSize:13, fontStyle:"italic" }}>
+                  Select a person above to tick their unavailable dates.
+                </div>
+              )}
             </div>
+
+            {/* Single add row (still available for one-off dates outside the range) */}
+            <details style={{ marginBottom:22 }}>
+              <summary style={{ cursor:"pointer", fontSize:12, color:C.inkSoft, marginBottom:10 }}>Add a single date manually</summary>
+              <div style={{ display:"flex", gap:12, flexWrap:"wrap", alignItems:"flex-end", background:"#fbfbfd", padding:16, borderRadius:12, border:`1px solid ${C.line}` }}>
+                <div>
+                  <label style={labelS}>Person</label>
+                  <select value={newUnavail.name} onChange={e=>setNewUnavail(p=>({...p,name:e.target.value}))} style={{ ...inputS, minWidth:190 }}>
+                    <option value="">— select —</option>
+                    {staff.filter(s=>s.name.trim()).map(s=><option key={s.id}>{s.name}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label style={labelS}>Date</label>
+                  <input type="date" value={newUnavail.date} onChange={e=>setNewUnavail(p=>({...p,date:e.target.value}))} style={inputS} />
+                </div>
+                <button onClick={addUnavail} style={btnPrimary}
+                  onMouseOver={e => e.currentTarget.style.background = C.accentDk}
+                  onMouseOut={e => e.currentTarget.style.background = C.accent}>+ Add</button>
+              </div>
+            </details>
 
             <table style={{ width:"100%", borderCollapse:"collapse", fontSize:13 }}>
               <thead>
@@ -702,6 +855,43 @@ export default function RotaApp() {
           fontSize:13, fontWeight:500, boxShadow:"0 8px 30px rgba(20,30,55,0.25)", zIndex:50,
         }}>{toast}</div>
       )}
+
+      {/* ── Unavailability conflict popup ── */}
+      {conflict && (
+        <div className="no-print" style={{
+          position:"fixed", inset:0, background:"rgba(20,30,55,0.45)", zIndex:100,
+          display:"flex", alignItems:"center", justifyContent:"center", padding:20,
+        }}>
+          <div style={{ ...card, maxWidth:420, width:"100%", padding:24 }}>
+            <h3 style={{ margin:"0 0 8px", fontSize:16, fontWeight:700 }}>Already assigned that day</h3>
+            <p style={{ margin:"0 0 18px", fontSize:13, color:C.inkSoft, lineHeight:1.5 }}>
+              <strong style={{ color:C.ink }}>{conflict.name}</strong> is now marked unavailable on{" "}
+              <strong style={{ color:C.ink }}>{fmtDate(parseLocalDate(conflict.dk))}</strong>, but is currently
+              assigned to: <strong style={{ color:C.ink }}>{conflict.jobs.join(", ")}</strong>. What would you like to do?
+            </p>
+            <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+              <button onClick={()=>resolveConflict("clear")} style={{ ...btnGhost, textAlign:"left" }}>
+                <strong>Clear the cell(s)</strong> — leave blank to refill manually
+              </button>
+              <button onClick={()=>resolveConflict("reassign")} style={{ ...btnGhost, textAlign:"left" }}>
+                <strong>Auto-reassign</strong> — give the role(s) to the next eligible person
+              </button>
+              <button onClick={()=>resolveConflict("keep")} style={{ ...btnGhost, textAlign:"left" }}>
+                <strong>Keep it</strong> — leave assigned, flagged red so I decide
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <style>{`
+        @media print {
+          .no-print { display: none !important; }
+          body { background: #fff !important; }
+          @page { margin: 12mm; }
+          main { padding: 0 !important; max-width: 100% !important; }
+        }
+      `}</style>
     </div>
   );
 }
