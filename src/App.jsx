@@ -50,6 +50,9 @@ const C = {
   badBg:     "#fdeaec",
   sunBg:     "#f3f6ff",
 };
+// Sentinel used by the cell dropdown to mean "this role isn't needed on this date".
+const BLOCK_VALUE = "__not_needed__";
+
 const FONT = "'Segoe UI', system-ui, -apple-system, 'Helvetica Neue', Arial, sans-serif";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -78,7 +81,9 @@ function getThursSuns(from, to) {
   }
   return days;
 }
-function autoFill(dates, staff, unavailMap) {
+// `dates` must already have skipped dates removed.
+// `blockedMap` = { "YYYY-MM-DD": ["Role A", ...] } — roles not required on that date.
+function autoFill(dates, staff, unavailMap, blockedMap = {}) {
   const count = {};
   staff.forEach(s => { count[s.id] = {}; JOBS.forEach(j => { count[s.id][j] = 0; }); });
   const result = {};
@@ -86,7 +91,9 @@ function autoFill(dates, staff, unavailMap) {
   dates.forEach(date => {
     const dk = dateKey(date);
     const usedToday = new Set();          // names already assigned a role this date
+    const blockedJobs = blockedMap[dk] || [];
     JOBS.forEach(job => {
+      if (blockedJobs.includes(job)) { result[dk][job] = ""; return; }  // role not needed today
       const unavailSet = unavailMap[dk] || new Set();
       const eligible = staff.filter(s =>
         s.name.trim() &&
@@ -115,6 +122,8 @@ const STORAGE_KEYS = {
   unavail:     "rota:unavail",
   dateRange:   "rota:dateRange",
   assignments: "rota:assignments",
+  skipped:     "rota:skipped",
+  blocked:     "rota:blocked",
 };
 
 // localStorage-backed persistence (per-browser, no backend).
@@ -199,6 +208,9 @@ export default function RotaApp() {
   const [staff, setStaff]         = useState(INITIAL_STAFF);
   const [unavail, setUnavail]     = useState([]);
   const [assignments, setAssignments] = useState({});
+  const [skipped, setSkipped]     = useState([]);   // ["YYYY-MM-DD", ...] — cancelled meetings
+  const [blocked, setBlocked]     = useState({});   // { "YYYY-MM-DD": ["Role", ...] } — roles not needed
+  const [dateMenu, setDateMenu]   = useState(null); // dk of the date whose options popup is open
   const [autoFilled, setAutoFilled]   = useState(false);
   const [newUnavail, setNewUnavail]   = useState({ name: "", date: "" });
   const [gridPerson, setGridPerson]   = useState("");      // person selected in the new tick-box grid
@@ -213,16 +225,20 @@ export default function RotaApp() {
   // ── Load all data on mount ──────────────────────────────────────────────────
   useEffect(() => {
     (async () => {
-      const [savedStaff, savedUnavail, savedRange, savedAssignments] = await Promise.all([
+      const [savedStaff, savedUnavail, savedRange, savedAssignments, savedSkipped, savedBlocked] = await Promise.all([
         storageGet(STORAGE_KEYS.staff),
         storageGet(STORAGE_KEYS.unavail),
         storageGet(STORAGE_KEYS.dateRange),
         storageGet(STORAGE_KEYS.assignments),
+        storageGet(STORAGE_KEYS.skipped),
+        storageGet(STORAGE_KEYS.blocked),
       ]);
       let anyLoaded = false;
       if (savedStaff)   { setStaff(savedStaff);   anyLoaded = true; }
       if (savedUnavail) { setUnavail(savedUnavail); anyLoaded = true; }
       if (savedRange)   { setFromDate(savedRange.from); setToDate(savedRange.to); anyLoaded = true; }
+      if (Array.isArray(savedSkipped)) { setSkipped(savedSkipped); anyLoaded = anyLoaded || savedSkipped.length > 0; }
+      if (savedBlocked && typeof savedBlocked === "object") { setBlocked(savedBlocked); anyLoaded = anyLoaded || Object.keys(savedBlocked).length > 0; }
       if (savedAssignments && Object.keys(savedAssignments).length) {
         setAssignments(savedAssignments);
         setAutoFilled(true);
@@ -237,7 +253,7 @@ export default function RotaApp() {
   }, []);
 
   // ── Auto-save (debounced 1.2s) ──────────────────────────────────────────────
-  const persistAll = useCallback((staffVal, unavailVal, from, to, assignVal) => {
+  const persistAll = useCallback((staffVal, unavailVal, from, to, assignVal, skippedVal, blockedVal) => {
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
       setSaveStatus("saving");
@@ -246,6 +262,8 @@ export default function RotaApp() {
         storageSet(STORAGE_KEYS.unavail,     unavailVal),
         storageSet(STORAGE_KEYS.dateRange,   { from, to }),
         storageSet(STORAGE_KEYS.assignments, assignVal),
+        storageSet(STORAGE_KEYS.skipped,     skippedVal),
+        storageSet(STORAGE_KEYS.blocked,     blockedVal),
       ]);
       setSaveStatus(results.every(Boolean) ? "saved" : "error");
       setTimeout(() => setSaveStatus(""), 3000);
@@ -253,8 +271,8 @@ export default function RotaApp() {
   }, []);
 
   useEffect(() => {
-    if (!loading) persistAll(staff, unavail, fromDate, toDate, assignments);
-  }, [staff, unavail, fromDate, toDate, assignments, loading, persistAll]);
+    if (!loading) persistAll(staff, unavail, fromDate, toDate, assignments, skipped, blocked);
+  }, [staff, unavail, fromDate, toDate, assignments, skipped, blocked, loading, persistAll]);
 
   function flashToast(msg) {
     setToast(msg);
@@ -265,9 +283,9 @@ export default function RotaApp() {
   function downloadBackup() {
     const payload = {
       app: "meeting-duties-rota",
-      version: 1,
+      version: 2,
       exportedAt: new Date().toISOString(),
-      data: { staff, unavail, dateRange: { from: fromDate, to: toDate }, assignments },
+      data: { staff, unavail, dateRange: { from: fromDate, to: toDate }, assignments, skipped, blocked },
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -301,6 +319,9 @@ export default function RotaApp() {
         }
         const a = d.assignments || {};
         setAssignments(a);
+        // v1 backups have no skipped/blocked — fall back to empty rather than failing.
+        setSkipped(Array.isArray(d.skipped) ? d.skipped : []);
+        setBlocked(d.blocked && typeof d.blocked === "object" ? d.blocked : {});
         setAutoFilled(Object.keys(a).length > 0);
         flashToast("Backup restored");
       } catch {
@@ -324,25 +345,68 @@ export default function RotaApp() {
     return m;
   }, [unavail]);
 
+  // Skipped dates (cancelled meetings) drop out of everything downstream.
+  const skippedSet = useMemo(() => new Set(skipped), [skipped]);
+  const activeDates    = useMemo(() => dates.filter(d => !skippedSet.has(dateKey(d))), [dates, skippedSet]);
+  const skippedInRange = useMemo(() => dates.filter(d =>  skippedSet.has(dateKey(d))), [dates, skippedSet]);
+
   const summary = useMemo(() => {
     const counts = {};
     staff.forEach(s => { counts[s.name] = {}; JOBS.forEach(j => { counts[s.name][j] = 0; }); counts[s.name].__total = 0; });
-    Object.values(assignments).forEach(day => {
+    Object.entries(assignments).forEach(([dk, day]) => {
+      if (skippedSet.has(dk)) return;              // cancelled meeting — doesn't count
       JOBS.forEach(job => {
         const name = day[job];
         if (name && counts[name]) { counts[name][job]++; counts[name].__total++; }
       });
     });
     return counts;
-  }, [assignments, staff]);
+  }, [assignments, staff, skippedSet]);
 
   // ── Handlers ────────────────────────────────────────────────────────────────
   function handleAutoFill() {
-    setAssignments(autoFill(dates, staff, unavailMap));
+    const fresh = autoFill(activeDates, staff, unavailMap, blocked);
+    // Keep whatever was on a skipped date, so un-skipping restores it intact.
+    setAssignments(prev => {
+      const merged = { ...fresh };
+      skipped.forEach(dk => { if (prev[dk]) merged[dk] = prev[dk]; });
+      return merged;
+    });
     setAutoFilled(true);
   }
   function handleCellChange(dk, job, value) {
     setAssignments(prev => ({ ...prev, [dk]: { ...(prev[dk]||{}), [job]: value } }));
+  }
+
+  // ── Skipped dates & blocked roles ───────────────────────────────────────────
+  function isBlocked(dk, job) { return (blocked[dk] || []).includes(job); }
+
+  function toggleSkip(dk) {
+    setSkipped(prev => prev.includes(dk) ? prev.filter(x => x !== dk) : [...prev, dk]);
+    setDateMenu(null);
+  }
+
+  // Mark a role as needed / not needed on a date. Blocking clears anyone in the cell.
+  function setBlock(dk, job, on) {
+    setBlocked(prev => {
+      const cur = prev[dk] || [];
+      const has = cur.includes(job);
+      if (on === has) return prev;
+      const next = on ? [...cur, job] : cur.filter(j => j !== job);
+      const out = { ...prev };
+      if (next.length) out[dk] = next; else delete out[dk];
+      return out;
+    });
+    if (on) {
+      setAssignments(prev => (prev[dk]?.[job] ? { ...prev, [dk]: { ...prev[dk], [job]: "" } } : prev));
+    }
+  }
+
+  // One handler for the cell dropdown — "not needed" blocks, anything else unblocks.
+  function handleCellSelect(dk, job, value) {
+    if (value === BLOCK_VALUE) setBlock(dk, job, true);
+    else { setBlock(dk, job, false); handleCellChange(dk, job, value); }
+    setEditingCell(null);
   }
   function isUnavail(dk, name) {
     return !!(unavailMap[dk] && name && unavailMap[dk].has(name));
@@ -417,9 +481,9 @@ export default function RotaApp() {
       return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
     };
     const header = ["Date", "Day", ...JOBS];
-    const rows = dates.map(d => {
+    const rows = activeDates.map(d => {
       const dk = dateKey(d);
-      return [fmtDate(d), fmtDay(d), ...JOBS.map(j => assignments[dk]?.[j] || "")];
+      return [fmtDate(d), fmtDay(d), ...JOBS.map(j => isBlocked(dk, j) ? "n/a" : (assignments[dk]?.[j] || ""))];
     });
     const csv = [header, ...rows].map(r => r.map(esc).join(",")).join("\r\n");
     const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" });
@@ -509,8 +573,11 @@ export default function RotaApp() {
                 </div>
               ))}
               <div style={{ color: C.inkSoft, fontSize: 13, paddingBottom: 9 }}>
-                <strong style={{ color: C.ink, fontSize: 16 }}>{dates.length}</strong> meetings
-                <span style={{ color: C.inkFaint }}> · {dates.filter(d=>d.getDay()===4).length} Thu, {dates.filter(d=>d.getDay()===0).length} Sun</span>
+                <strong style={{ color: C.ink, fontSize: 16 }}>{activeDates.length}</strong> meetings
+                <span style={{ color: C.inkFaint }}> · {activeDates.filter(d=>d.getDay()===4).length} Thu, {activeDates.filter(d=>d.getDay()===0).length} Sun</span>
+                {skippedInRange.length > 0 && (
+                  <span style={{ color: C.warn, fontWeight: 600 }}> · {skippedInRange.length} skipped</span>
+                )}
               </div>
               <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center" }}>
                 {autoFilled && (
@@ -532,7 +599,29 @@ export default function RotaApp() {
               </div>
             </div>
 
-            {!autoFilled && dates.length > 0 && (
+            {/* Skipped meetings — removed from the table, restorable from here */}
+            {skippedInRange.length > 0 && (
+              <div className="no-print" style={{ ...card, padding: "12px 16px", marginBottom: 18, display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                <span style={{ fontSize: 11, fontWeight: 600, color: C.inkFaint, textTransform: "uppercase", letterSpacing: 0.8 }}>Skipped</span>
+                {skippedInRange.map(d => {
+                  const dk = dateKey(d);
+                  return (
+                    <button key={dk} onClick={() => toggleSkip(dk)} title="Restore this meeting"
+                      style={{
+                        display: "inline-flex", alignItems: "center", gap: 7, padding: "6px 11px",
+                        borderRadius: 20, cursor: "pointer", fontFamily: "inherit", fontSize: 12,
+                        fontWeight: 500, background: C.warnBg, color: C.warn, border: `1px solid ${C.warn}33`,
+                      }}>
+                      {fmtDate(d)}
+                      <span style={{ fontSize: 14, lineHeight: 1 }}>×</span>
+                    </button>
+                  );
+                })}
+                <span style={{ fontSize: 11, color: C.inkFaint, marginLeft: "auto" }}>Click to restore</span>
+              </div>
+            )}
+
+            {!autoFilled && activeDates.length > 0 && (
               <div style={{ ...card, background: C.accentBg, border: `1px solid ${C.accent}22`, padding: 14, marginBottom: 18, color: C.accentDk, fontSize: 13, textAlign: "center" }}>
                 Click <strong>Auto-fill rota</strong> to assign people automatically by role and availability — or click any cell to fill it in yourself.
               </div>
@@ -542,8 +631,13 @@ export default function RotaApp() {
                 No Thursdays or Sundays fall in this date range. Try adjusting the dates.
               </div>
             )}
+            {dates.length > 0 && activeDates.length === 0 && (
+              <div style={{ ...card, background: C.warnBg, border: `1px solid ${C.warn}22`, padding: 18, color: C.warn, textAlign: "center", fontSize: 13 }}>
+                Every meeting in this range has been skipped. Restore one above to see the rota.
+              </div>
+            )}
 
-            {dates.length > 0 && (
+            {activeDates.length > 0 && (
               <div style={{ ...card, overflow: "hidden" }}>
                 <div style={{ overflowX: "auto" }}>
                   <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
@@ -556,30 +650,44 @@ export default function RotaApp() {
                       </tr>
                     </thead>
                     <tbody>
-                      {dates.map(date => {
+                      {activeDates.map(date => {
                         const dk = dateKey(date);
                         const isSun = date.getDay() === 0;
                         const rowBg = isSun ? C.sunBg : "#fff";
                         return (
                           <tr key={dk}>
-                            <td style={{ ...tdS, paddingLeft: 16, background: rowBg, fontWeight: 600, color: C.ink, whiteSpace: "nowrap" }}>{fmtDate(date)}</td>
+                            <td onClick={() => setDateMenu(dk)} title="Date options — skip this meeting or block roles"
+                              style={{ ...tdS, paddingLeft: 16, background: rowBg, fontWeight: 600, color: C.ink, whiteSpace: "nowrap", cursor: "pointer" }}>
+                              {fmtDate(date)}
+                              <span className="no-print" style={{ color: C.inkFaint, fontWeight: 400, marginLeft: 6, fontSize: 11 }}>⋯</span>
+                            </td>
                             <td style={{ ...tdS, background: rowBg, color: isSun ? C.accent : C.inkSoft, fontWeight: isSun ? 600 : 400 }}>{fmtDay(date)}</td>
                             {JOBS.map(job => {
-                              const val = assignments[dk]?.[job] || "";
-                              const clash = isUnavail(dk, val);
+                              const off = isBlocked(dk, job);
+                              const val = off ? "" : (assignments[dk]?.[job] || "");
+                              const clash = !off && isUnavail(dk, val);
                               const isEditing = editingCell?.dk===dk && editingCell?.job===job;
                               return (
-                                <td key={job} style={{ ...tdS, padding: 0, background: clash ? C.badBg : rowBg }}>
+                                <td key={job} style={{ ...tdS, padding: 0, background: clash ? C.badBg : (off ? "#f7f8fa" : rowBg) }}>
                                   {isEditing ? (
-                                    <select autoFocus value={val}
-                                      onChange={e => { handleCellChange(dk, job, e.target.value); setEditingCell(null); }}
+                                    <select autoFocus value={off ? BLOCK_VALUE : val}
+                                      onChange={e => handleCellSelect(dk, job, e.target.value)}
                                       onBlur={() => setEditingCell(null)}
                                       style={{ width:"100%", padding:"8px 6px", border:`2px solid ${C.accent}`, background:"#fff", fontFamily:"inherit", fontSize:12, borderRadius:8, color:C.ink }}>
                                       <option value="">— unassigned —</option>
+                                      <option value={BLOCK_VALUE}>— not needed —</option>
                                       {staff.filter(s=>s.name.trim()&&s.jobs.includes(job)).map(s=>(
                                         <option key={s.id} value={s.name}>{s.name}{(unavailMap[dk]||new Set()).has(s.name)?" (away)":""}</option>
                                       ))}
                                     </select>
+                                  ) : off ? (
+                                    <div onClick={() => setEditingCell({dk,job})} title="Not needed on this date — click to change"
+                                      style={{
+                                        margin:"5px 6px", padding:"4px 8px", cursor:"pointer", minHeight:18,
+                                        display:"flex", alignItems:"center", justifyContent:"center",
+                                        border:`1px dashed ${C.inkFaint}66`, borderRadius:7,
+                                        color:C.inkFaint, fontSize:11, fontStyle:"italic",
+                                      }}>n/a</div>
                                   ) : (
                                     <div onClick={() => setEditingCell({dk,job})} style={{
                                       padding:"9px 10px", cursor:"pointer", minHeight:20,
@@ -604,6 +712,8 @@ export default function RotaApp() {
                 <div style={{ padding:"11px 16px", background:"#fbfbfd", borderTop:`1px solid ${C.line}`, fontSize:11, color:C.inkFaint, display:"flex", gap:18, flexWrap:"wrap" }}>
                   <span>Blue rows are Sundays</span>
                   <span>Red cell = person is away — click to reassign</span>
+                  <span className="no-print">Click a date to skip it or block roles</span>
+                  <span className="no-print">n/a = role not needed that date</span>
                   <span style={{ marginLeft:"auto" }}>Changes save automatically</span>
                 </div>
               </div>
@@ -687,14 +797,14 @@ export default function RotaApp() {
                   {staff.filter(s=>s.name.trim()).map(s=><option key={s.id}>{s.name}</option>)}
                 </select>
               </div>
-              {gridPerson && dates.length === 0 && (
+              {gridPerson && activeDates.length === 0 && (
                 <div style={{ color:C.inkFaint, fontSize:13, fontStyle:"italic" }}>
                   No meeting dates in the current range — set a date range on the Rota tab first.
                 </div>
               )}
-              {gridPerson && dates.length > 0 && (
+              {gridPerson && activeDates.length > 0 && (
                 <div style={{ display:"flex", flexWrap:"wrap", gap:8 }}>
-                  {dates.map(d => {
+                  {activeDates.map(d => {
                     const dk = dateKey(d);
                     const off = (unavailMap[dk] || new Set()).has(gridPerson);
                     const isSun = d.getDay() === 0;
@@ -765,7 +875,7 @@ export default function RotaApp() {
                 )}
                 {[...unavail].sort((a,b)=>a.date.localeCompare(b.date)).map(u=>{
                   const dt = parseLocalDate(u.date);
-                  const isMeetingDay = dates.some(d=>dateKey(d)===u.date);
+                  const isMeetingDay = activeDates.some(d=>dateKey(d)===u.date);
                   return (
                     <tr key={u.id}>
                       <td style={{ ...tdS, paddingLeft:14, fontWeight:600 }}>{u.name}</td>
@@ -795,7 +905,7 @@ export default function RotaApp() {
             <h2 style={{ margin:"0 0 6px", fontSize:16, fontWeight:700 }}>Assignment Summary</h2>
             <p style={{ margin:"0 0 18px", color:C.inkSoft, fontSize:13 }}>
               {autoFilled
-                ? `Counts across the current rota period (${dates.length} meetings).`
+                ? `Counts across the current rota period (${activeDates.length} meetings${skippedInRange.length ? `, ${skippedInRange.length} skipped` : ""}).`
                 : "Generate the rota first to see assignment counts."}
             </p>
             {!autoFilled ? (
@@ -854,6 +964,52 @@ export default function RotaApp() {
           background:C.ink, color:"#fff", padding:"11px 20px", borderRadius:12,
           fontSize:13, fontWeight:500, boxShadow:"0 8px 30px rgba(20,30,55,0.25)", zIndex:50,
         }}>{toast}</div>
+      )}
+
+      {/* ── Date options popup (skip the meeting / choose which roles are needed) ── */}
+      {dateMenu && (
+        <div className="no-print" onClick={() => setDateMenu(null)} style={{
+          position:"fixed", inset:0, background:"rgba(20,30,55,0.45)", zIndex:100,
+          display:"flex", alignItems:"center", justifyContent:"center", padding:20,
+        }}>
+          <div onClick={e => e.stopPropagation()} style={{ ...card, maxWidth:440, width:"100%", padding:24, maxHeight:"85vh", overflowY:"auto" }}>
+            <h3 style={{ margin:"0 0 4px", fontSize:16, fontWeight:700 }}>{fmtDate(parseLocalDate(dateMenu))}</h3>
+            <p style={{ margin:"0 0 18px", fontSize:12, color:C.inkFaint }}>{fmtDay(parseLocalDate(dateMenu))}</p>
+
+            <button onClick={() => toggleSkip(dateMenu)} style={{ ...btnGhost, width:"100%", textAlign:"left", marginBottom:20 }}
+              onMouseOver={e => e.currentTarget.style.borderColor = C.warn}
+              onMouseOut={e => e.currentTarget.style.borderColor = C.line}>
+              <strong>Skip this meeting</strong> — remove the date from the rota
+            </button>
+
+            <div style={{ fontSize:11, fontWeight:600, color:C.inkFaint, textTransform:"uppercase", letterSpacing:0.8, marginBottom:10 }}>
+              Roles needed on this date
+            </div>
+            <div style={{ display:"flex", flexDirection:"column", gap:2, marginBottom:18 }}>
+              {JOBS.map(job => {
+                const needed = !isBlocked(dateMenu, job);
+                return (
+                  <label key={job} style={{
+                    display:"flex", alignItems:"center", gap:10, padding:"8px 10px", borderRadius:8,
+                    cursor:"pointer", fontSize:13, color: needed ? C.ink : C.inkFaint,
+                    background: needed ? "transparent" : "#f7f8fa",
+                  }}>
+                    <input type="checkbox" checked={needed}
+                      onChange={e => setBlock(dateMenu, job, !e.target.checked)}
+                      style={{ width:16, height:16, cursor:"pointer", accentColor:C.accent }} />
+                    <span style={{ textDecoration: needed ? "none" : "line-through" }}>{job}</span>
+                  </label>
+                );
+              })}
+            </div>
+            <p style={{ margin:"0 0 16px", fontSize:12, color:C.inkSoft, lineHeight:1.5 }}>
+              Un-ticked roles show as <em>n/a</em> and are left alone by auto-fill. Skips and blocks survive a re-generate.
+            </p>
+            <button onClick={() => setDateMenu(null)} style={{ ...btnPrimary, width:"100%" }}
+              onMouseOver={e => e.currentTarget.style.background = C.accentDk}
+              onMouseOut={e => e.currentTarget.style.background = C.accent}>Done</button>
+          </div>
+        </div>
       )}
 
       {/* ── Unavailability conflict popup ── */}
